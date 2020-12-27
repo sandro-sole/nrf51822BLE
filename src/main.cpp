@@ -4,9 +4,22 @@
 #include "nrf_soc.h"
 #include "nrf_nvic.h"
 
+//Infos:
+/// Datasheet
+/// https://infocenter.nordicsemi.com/pdf/nRF51822_PS_v3.1.pdf
+//
+/// LE
+/// https://www.forward.com.au/pfod/BLE/LowPower/index.html#lp_timer
+//  #include <lp_timer.h>
+
+//good balance bwtween LE and discorvery...
 #define ADVERTISING_INTERVAL 2500
+#define VBAT_MAX_IN_MV 3000
+
 #define PIN_SW_SENSOR PIN_BUTTON1
 #define PIN_LED_BLE PIN_LED2
+
+//Max Transmition-Power
 #define TX_POWER 4
 
 ///
@@ -15,6 +28,10 @@ void characteristicWrittenCallback(BLECentral&, BLECharacteristic&);
 void updateAdvertisingScanData();
 void sensorValueChanged();
 void digitalWriteLog(uint32_t ulPin, uint32_t ulVal);
+unsigned char getBatteryLevel(void);
+void bleConnectedCallback(BLECentral &);
+
+
 volatile uint32_t g_counterValue = 0;
 uint32_t g_old_counterValue = g_counterValue;
 volatile bool g_sensorValueChanged = false;
@@ -25,8 +42,18 @@ const char g_deviceName[] = "CasaVerde Plant Humidity";
 
 BLEPeripheral blePeripheral = BLEPeripheral();
 
-BLEService ledService = BLEService("19b10000e8f2537e4f6cd104768a1214");
-BLECharCharacteristic ledCharacteristic = BLECharCharacteristic("19b10001e8f2537e4f6cd104768a1214", BLERead | BLEWrite);
+//BLEService ledService =                              BLEService("19b10000e8f2537e4f6cd104768a1214");
+//BLECharCharacteristic ledCharacteristic = BLECharCharacteristic("19b10001e8f2537e4f6cd104768a1214", BLERead | BLEWrite);
+
+
+BLEService mainBleService                        ("838c2bb4-42d1-11eb-b378-0242ac130002");
+BLEUnsignedIntCharacteristic sensorCharacteristic("7f461cfe-42d1-11eb-b378-0242ac130002", BLERead | BLEWrite);
+BLECharCharacteristic  ledCharacteristic         ("5f58b230-42d1-11eb-b378-0242ac130002", BLERead | BLEWrite);
+
+BLEService                                batteryService("180F");
+BLEUnsignedCharCharacteristic batteryLevelCharacteristic("2A19", BLERead);
+void sensorCharacteristicWrittenCallback(BLECentral &, BLECharacteristic &);
+
 
 void setup() {
   #ifdef ENABLE_LOG
@@ -38,16 +65,27 @@ void setup() {
 
   pinMode(PIN_SW_SENSOR, INPUT_PULLUP);
 
-
-  blePeripheral.setAdvertisedServiceUuid(ledService.uuid());
-  blePeripheral.addAttribute(ledService);
-  blePeripheral.addAttribute(ledCharacteristic);
   blePeripheral.setLocalName(g_localName);
   blePeripheral.setDeviceName(g_deviceName);
-  
+
+  blePeripheral.setAdvertisedServiceUuid(mainBleService.uuid());
+  blePeripheral.addAttribute(mainBleService);
+  blePeripheral.addAttribute(ledCharacteristic);
+  blePeripheral.addAttribute(sensorCharacteristic);
+
+  blePeripheral.addAttribute(batteryService);
+  blePeripheral.addAttribute(batteryLevelCharacteristic);
+
   blePeripheral.setAdvertisingInterval(ADVERTISING_INTERVAL);
   ledCharacteristic.setEventHandler(BLEWritten, characteristicWrittenCallback);
-  
+
+  sensorCharacteristic.setValue(g_counterValue);
+  sensorCharacteristic.setEventHandler(BLEWritten, sensorCharacteristicWrittenCallback);
+ 
+  blePeripheral.setEventHandler(BLEConnected, bleConnectedCallback);
+
+
+
   blePeripheral.begin();
   blePeripheral.setTxPower(TX_POWER);
 
@@ -75,8 +113,11 @@ void loop() {
   if (g_sensorValueChanged) {
       g_sensorValueChanged = false;
       #ifdef ENABLE_LOG
-        Serial.print(F("g_sensorValueChanged..."));
+        Serial.print(F("g_sensorValueChanged, count: "));
+        Serial.print(g_counterValue);
+        Serial.println(F("."));
       #endif  
+      sensorCharacteristic.setValue(g_counterValue);
       updateAdvertisingScanData();
       //digitalWriteLog(PIN_LED_SENSOR, LOW);
   }
@@ -84,6 +125,17 @@ void loop() {
   // poll peripheral
   blePeripheral.poll();
 }
+
+void bleConnectedCallback(BLECentral &bleCentral)
+{
+  unsigned char batteryLevel = getBatteryLevel();
+  if (batteryLevel > 100)
+  {
+    batteryLevel = 100;
+  }
+  batteryLevelCharacteristic.setValue(batteryLevel);
+}
+
 
 void characteristicWrittenCallback(BLECentral& central, BLECharacteristic& characteristic) {
   // central wrote new value to characteristic, update LED
@@ -121,6 +173,44 @@ void sensorValueChanged()
   g_lastSensorValueChanged = millis();
 #endif  
 }
+
+void sensorCharacteristicWrittenCallback(BLECentral &central, BLECharacteristic &characteristic)
+{
+  // The new value has already been written on characteristic
+  // We still save it and flag the value as changed to allow the advertising packet to be updated
+  g_sensorValueChanged = true;
+  g_counterValue = *characteristic.value();
+}
+
+unsigned char getBatteryLevel(void)
+{
+  // Configure ADC
+  NRF_ADC->CONFIG = (ADC_CONFIG_RES_8bit << ADC_CONFIG_RES_Pos) |
+                    (ADC_CONFIG_INPSEL_SupplyOneThirdPrescaling << ADC_CONFIG_INPSEL_Pos) |
+                    (ADC_CONFIG_REFSEL_VBG << ADC_CONFIG_REFSEL_Pos) |
+                    (ADC_CONFIG_PSEL_Disabled << ADC_CONFIG_PSEL_Pos) |
+                    (ADC_CONFIG_EXTREFSEL_None << ADC_CONFIG_EXTREFSEL_Pos);
+  NRF_ADC->EVENTS_END = 0;
+  NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Enabled;
+
+  NRF_ADC->EVENTS_END = 0; // Stop any running conversions.
+  NRF_ADC->TASKS_START = 1;
+
+  while (!NRF_ADC->EVENTS_END)
+  {
+  }
+
+  uint16_t vbg_in_mv = 1200;
+  uint8_t adc_max = 255;
+  uint16_t vbat_current_in_mv = (NRF_ADC->RESULT * 3 * vbg_in_mv) / adc_max;
+
+  NRF_ADC->EVENTS_END = 0;
+  NRF_ADC->TASKS_STOP = 1;
+  NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Disabled;
+
+  return (unsigned char)((vbat_current_in_mv * 100) / VBAT_MAX_IN_MV);
+}
+
 
 // https://www.bluetooth.com/specifications/assigned-numbers/generic-access-profile/
 void updateAdvertisingScanData()
